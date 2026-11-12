@@ -3,8 +3,10 @@
  *
  * Based on pi's `examples/extensions/plan-mode`, extended in two directions.
  *
- * 1. ENFORCEMENT. While planning, `edit` and `write` are not active tools and `bash` is limited to
- *    an allowlist of read-only commands. The model cannot change the repo — not "should not".
+ * 1. ENFORCEMENT. While planning, `edit` and `write` are not active tools, and `bash` runs only
+ *    commands the read-only allowlist recognises. Anything else is put to the human, who may allow
+ *    it once, trust the executable for the session, or block it — a gate, not a wall, because a
+ *    planner that cannot run one probing command plans from fiction.
  *
  * 2. THE ARTIFACT. `write_plan` is the only way to write a file in plan mode, and it can only write
  *    `docs/plans/YYYY-MM-DD_<slug>.md`. So the plan outlives the session, and the write channel is
@@ -17,7 +19,7 @@
  * AFTER APPROVAL the plan's declared file list is enforced: `edit`/`write` to a path the plan does
  * not name is blocked, and `/plan allow <path>` extends the set deliberately.
  *
- * Commands: /plan [on|off|go|allow <path>|status] · /todos · Ctrl+Alt+P
+ * Commands: /plan [on|off|go|allow <path>|trust <command>|status] · /todos · Ctrl+Alt+P
  */
 
 import * as fs from "node:fs";
@@ -33,7 +35,7 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { type TodoItem, isSafeCommand, markCompletedSteps } from "./utils.ts";
+import { type TodoItem, explainUnsafe, exeNames, markCompletedSteps } from "./utils.ts";
 
 const WRITE_PLAN_TOOL = "write_plan";
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", WRITE_PLAN_TOOL];
@@ -53,6 +55,8 @@ interface PlanModeState {
 	files: string[];
 	awaitingApproval?: boolean;
 	toolsBeforePlanMode?: string[];
+	/** Executables the human allowed by hand this session (see the plan-mode bash prompt). */
+	sessionAllowed?: string[];
 }
 
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
@@ -102,6 +106,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 	let files: string[] = [];
 	let awaitingApproval = false;
 	let toolsBeforePlanMode: string[] | undefined;
+	let sessionAllowed: string[] = [];
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only, plans to docs/plans/)",
@@ -122,9 +127,10 @@ export default function planExtension(pi: ExtensionAPI): void {
 				),
 			);
 		} else if (enabled) {
+			const trusted = sessionAllowed.length > 0 ? ` +${sessionAllowed.length}` : "";
 			ctx.ui.setStatus(
 				"plan-mode",
-				ctx.ui.theme.fg("warning", awaitingApproval ? "⏸ plan — awaiting /plan go" : "⏸ plan"),
+				ctx.ui.theme.fg("warning", (awaitingApproval ? "⏸ plan — awaiting /plan go" : "⏸ plan") + trusted),
 			);
 			ctx.ui.setWidget("plan-todos", undefined);
 		} else {
@@ -160,12 +166,14 @@ export default function planExtension(pi: ExtensionAPI): void {
 			files,
 			awaitingApproval,
 			toolsBeforePlanMode,
+			sessionAllowed,
 		} satisfies PlanModeState);
 	}
 
 	function enterPlanMode(ctx: ExtensionContext): void {
 		enabled = true;
 		executing = false;
+		sessionAllowed = [];
 		enablePlanTools();
 		updateStatus(ctx);
 		persist();
@@ -175,6 +183,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = false;
 		executing = false;
 		awaitingApproval = false;
+		sessionAllowed = [];
 		restoreNormalTools();
 		ctx.ui.notify(note, "info");
 		updateStatus(ctx);
@@ -190,6 +199,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = false;
 		executing = true;
 		awaitingApproval = false;
+		sessionAllowed = []; // the step-up list was for planning; execution has full access
 		restoreNormalTools();
 		updateStatus(ctx);
 		persist();
@@ -219,9 +229,9 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 		label: "Write plan",
 		description:
 			"Write the implementation plan to docs/plans/<YYYY-MM-DD>_<slug>.md. The only file that can be " +
-			"written in plan mode. Call it once, when the plan is complete; it ends the turn and waits for " +
-			"the user to approve with /plan go. Pass every file the plan will edit in `files` — after " +
-			"approval those are the only paths that may be touched.",
+			"written in plan mode. Call it once, when the plan is complete, then stop: it writes the file " +
+			"and waits for the user to approve with /plan go. Pass every file the plan will edit in " +
+			"`files` — after approval those are the only paths that may be touched.",
 		parameters: Type.Object({
 			slug: Type.String({ description: "kebab-case topic, e.g. activities-endpoint" }),
 			content: Type.String({ description: "The plan body in markdown, starting with context, then ## Steps" }),
@@ -255,6 +265,23 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 				// Steps drive the progress widget and the resume path; a plan without them cannot be executed.
 				return {
 					content: [{ type: "text", text: "The plan needs a `## Steps` section with a numbered list." }],
+					details: {},
+					isError: true,
+				};
+			}
+			const steps = extractSteps(body);
+			if (steps.length === 0) {
+				// A heading with no parseable steps leaves the progress widget, [DONE:n], and the
+				// completion check with nothing to work on — the plan would run blind.
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"`## Steps` has no numbered steps. Use `1. **step** — ...` lines directly under the heading " +
+								"(not `-` bullets, not a subheading): they drive the progress widget and [DONE:n].",
+						},
+					],
 					details: {},
 					isError: true,
 				};
@@ -294,7 +321,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 
 			planPath = path.join(PLANS_DIR, `${today()}_${slug}.md`);
 			files = declared;
-			todos = extractSteps(body);
+			todos = steps;
 			awaitingApproval = true;
 			persist();
 
@@ -357,7 +384,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 
 	// ── commands ────────────────────────────────────────────────────────────────────────────────
 	pi.registerCommand("plan", {
-		description: "Plan mode: on | off | go | allow <path> | status (no argument toggles)",
+		description: "Plan mode: on | off | go | allow <path> | trust <command> | status (no argument toggles)",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const arg = rest.join(" ");
@@ -376,12 +403,25 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 					ctx.ui.notify(`Approved path added: ${arg}`, "info");
 					return;
 				}
+				case "trust": {
+					if (!arg) {
+						return ctx.ui.notify(
+							`Allowed by hand this session: ${sessionAllowed.length ? sessionAllowed.join(", ") : "none"}`,
+							"info",
+						);
+					}
+					sessionAllowed = unique([...sessionAllowed, arg.trim()]);
+					persist();
+					updateStatus(ctx);
+					return ctx.ui.notify(`${arg.trim()} may now run in plan mode this session`, "info");
+				}
 				case "status": {
 					const lines = [
 						`mode: ${enabled ? "plan (read-only)" : executing ? "executing" : "normal"}`,
 						`plan: ${planPath ?? "none"}`,
 						`files: ${files.length ? files.join(", ") : "none declared"}`,
 						`steps: ${todos.filter((t) => t.completed).length}/${todos.length} done`,
+						`trusted: ${sessionAllowed.length ? sessionAllowed.join(", ") : "none (every step-up asks)"}`,
 					];
 					return ctx.ui.notify(lines.join("\n"), "info");
 				}
@@ -411,16 +451,36 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 
 	// ── enforcement ─────────────────────────────────────────────────────────────────────────────
 	pi.on("tool_call", async (event, ctx) => {
-		// 1. Planning: bash is read-only.
+		// 1. Planning: bash is read-only by default, and a human may step it up for one command.
+		//    The gate is human judgement, so a research command the allowlist does not recognise is a
+		//    question, not a dead end. Without a UI there is nobody to ask, so it stays blocked.
 		if (enabled && event.toolName === "bash") {
 			const command = String(event.input.command ?? "");
-			if (!isSafeCommand(command)) {
-				return {
-					block: true,
-					reason:
-						"Plan mode: command blocked (not on the read-only allowlist). Investigate with read/grep/find/ls, " +
-						`or ask the user to /plan off.\nCommand: ${command}`,
-				};
+			const why = explainUnsafe(command);
+			if (why) {
+				const names = exeNames(command);
+				const trusted = names.length > 0 && names.every((n) => sessionAllowed.includes(n));
+				if (!trusted) {
+					if (!ctx.hasUI) {
+						return { block: true, reason: `Plan mode: ${why}. No UI available to approve an exception.` };
+					}
+					const trustLabel = names.length ? `Allow ${names.join(", ")} for this session` : undefined;
+					const choice = await ctx.ui.select(
+						`Plan mode — this command is not read-only\n\n${command}\n\nReason: ${why}`,
+						["Run this once", ...(trustLabel ? [trustLabel] : []), "Block"],
+					);
+					if (!choice || choice === "Block") {
+						return {
+							block: true,
+							reason: `Plan mode: blocked by the user (${why}). Investigate with read/rg/find instead of retrying.`,
+						};
+					}
+					if (trustLabel && choice === trustLabel) {
+						sessionAllowed = unique([...sessionAllowed, ...names]);
+						persist();
+						updateStatus(ctx);
+					}
+				}
 			}
 		}
 
@@ -483,14 +543,18 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 					customType: "plan-mode-context",
 					content: `[PLAN MODE ACTIVE — read-only]
 
-You are planning, not building. \`edit\` and \`write\` are not available; bash is restricted to a
-read-only allowlist. Nothing you do can change this repo, and that is intended.
+You are planning, not building. \`edit\` and \`write\` are not available, and bash runs read-only
+commands without asking: reading, searching, git log/diff/show, and the like.
+
+Investigating is expected. If a command you need is outside that set — a test run, a script, a
+build — run it anyway: the human is asked whether to allow it, and their answer is the policy.
+A refusal means "find another way", not "try a variant of the same command".
 
 Do this, in order:
 1. Read the project's AGENTS.md, then the files that will change. State your assumptions.
 2. If the request is ambiguous in a way that changes the plan, ask — do not guess.
 3. Write the plan with the \`write_plan\` tool. The \`plan\` skill holds the document convention; the
-   tool enforces what it can (ISO-dated filename, frontmatter, a required \`## Steps\` section).
+   tool enforces what it can (ISO-dated filename, frontmatter, numbered \`## Steps\`).
    Pass every file you intend to edit in \`files\`; after approval those are the only paths you may touch.
 4. Then STOP. Two lines of summary, no work.
 
@@ -562,6 +626,7 @@ Do not begin implementing. The user approves with /plan go.`,
 			files = last.data.files ?? [];
 			awaitingApproval = last.data.awaitingApproval ?? false;
 			toolsBeforePlanMode = last.data.toolsBeforePlanMode;
+			sessionAllowed = last.data.sessionAllowed ?? [];
 		}
 
 		// On resume mid-execution, rebuild progress from the transcript after the execute marker.

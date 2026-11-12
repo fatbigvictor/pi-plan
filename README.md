@@ -7,6 +7,14 @@ plan is a file that outlives the session, and **nothing executes until a human a
 pi install git:github.com/fatbigvictor/pi-plan
 ```
 
+## Planning is investigative
+
+A planner that cannot run one command plans from fiction. Plan mode therefore denies quietly only
+what is certainly read-only — reading, searching, `git log|diff|show`, `npm ls`, `curl`, and the
+like — and puts everything else to you: a test run, a build, a scratch script. You answer *run once*,
+*trust this executable for the session*, or *block*. The agent cannot grant itself any of the three,
+which is the same asymmetry as `/plan go`, applied to a single command.
+
 ## Why this exists
 
 Coding agents "plan" by talking. The plan lives in the transcript, dies with the session, and gives
@@ -25,7 +33,8 @@ This package ships both: the `plan` extension for the first, the `plan` skill fo
 | while planning | by |
 |---|---|
 | `edit` / `write` unusable | removed from the active tool set **and** blocked in the `tool_call` interceptor |
-| `bash` read-only | allowlist — no `rm`, `mv`, `git commit`, `npm install`, editors |
+| `bash` read-only by default | every segment's executable must be on the read-only allowlist; no `rm`, `mv`, `git commit`, `npm install`, editors, redirection, or substitution |
+| anything else is a question | a command the allowlist does not recognise asks the human: run once, trust the executable for the session, or block |
 | the plan is a file | `write_plan` is the only write channel, and only writes `docs/plans/YYYY-MM-DD_<slug>.md` |
 | nothing runs early | `edit`/`write` return only from `approve()` — `/plan go`, or the dialog |
 | edits stay in scope | after approval, edits outside the plan's declared `files` are blocked |
@@ -48,7 +57,8 @@ itself.
 /plan on | off        explicit
 /plan go              approve the written plan and start executing
 /plan allow <path>    approve one extra path (when reality differs from the plan)
-/plan status          mode, plan file, approved files, step progress
+/plan trust <command> stop asking about one executable this session (no argument: list them)
+/plan status          mode, plan file, approved files, step progress, trusted commands
 /todos                step checklist
 Ctrl+Alt+P            toggle
 pi --plan             start in plan mode

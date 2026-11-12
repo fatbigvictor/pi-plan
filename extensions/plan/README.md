@@ -8,13 +8,18 @@ plan is a **file** and the gate is **enforced**.
 | while planning | mechanism |
 |---|---|
 | `edit` / `write` unusable | removed from the active tool set (`setActiveTools`) **and** blocked in the `tool_call` interceptor |
-| `bash` read-only | allowlist (`utils.ts: isSafeCommand`) — no `rm`, `mv`, `git commit`, `npm install`, editors |
+| `bash` read-only by default | `utils.ts: explainUnsafe` — the line is split into segments and every segment's executable must be read-only; redirection, substitution, and heredocs are refused outright |
+| anything else asks the human | `tool_call` interceptor — run once, trust the executable for the session, or block |
 | the plan is a file | `write_plan` is the only write channel, and it can only write `docs/plans/YYYY-MM-DD_<slug>.md` |
 | nothing executes early | `edit`/`write` come back only from `approve()` — `/plan go` or the dialog |
 | edits stay in scope | after approval, `edit`/`write` are blocked outside the plan's declared `files` |
 
 The last two matter most. An extension that restores its own tools is not a gate, and an approval
 that names no files is a mood rather than a set.
+
+The allowlist is per segment, not per line: `rg "code" src/` is research and `ls && sed -i s/a/b/ f`
+is a write. Checking the whole line with one blocklist got both of those wrong — the first was blocked
+by the word "code", the second passed because it began with `ls`. `utils.test.ts` holds the cases.
 
 ## Commands
 
@@ -23,7 +28,8 @@ that names no files is a mood rather than a set.
 /plan on | off        explicit
 /plan go              approve the written plan and start executing
 /plan allow <path>    approve one extra path (when reality differs from the plan)
-/plan status          mode, plan file, approved files, step progress
+/plan trust <command> stop asking about one executable this session (no argument: list them)
+/plan status          mode, plan file, approved files, step progress, trusted commands
 /todos                step checklist
 Ctrl+Alt+P            toggle
 ```

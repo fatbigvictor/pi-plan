@@ -22,10 +22,16 @@ parts that a prompt cannot:
 | while planning | enforced by |
 |---|---|
 | `edit` / `write` are not available | tool set |
-| `bash` is read-only | allowlist |
+| `bash` is read-only by default | per-segment allowlist |
+| a command it does not know | you ask the human — they answer, not you |
 | the plan is a file in `docs/plans/` | `write_plan` is the only write channel |
 | nothing executes before approval | the tool set is restored only by `/plan go` |
 | edits stay inside the plan's file list | `tool_call` interceptor |
+
+Investigating is part of planning. Reading, searching, `git log|diff|show`, and `npm ls` just run.
+For anything else — a test, a build, a scratch script — try it: the human is asked whether to allow
+it. A refusal means the plan does not need that command, so plan around it. Do not retry a refused
+command in a new shape.
 
 So: **write the plan with the `write_plan` tool, then stop.** Do not start implementing, and do not
 describe what you "would" do instead of writing the file — the file is the deliverable.
