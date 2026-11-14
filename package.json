@@ -1,7 +1,7 @@
 {
   "name": "pi-plan",
-  "version": "0.1.0",
-  "description": "Hard-stop plan mode for pi: read-only while planning, plans land in docs/plans/, and nothing executes until a human approves",
+  "version": "0.2.0",
+  "description": "Hard-stop plan mode for pi: read-only while planning, questions asked before the plan, two approval modes, plans land in docs/plans/, and nothing executes until a human approves",
   "keywords": ["pi-package", "plan-mode", "planning"],
   "license": "MIT",
   "scripts": {

@@ -9,9 +9,17 @@
  */
 
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import { test } from "node:test";
 
-import { explainUnsafe, exeNames, isSafeCommand, markCompletedSteps, parseCommand } from "./utils.ts";
+import {
+	explainUnsafe,
+	exeNames,
+	isApprovedTarget,
+	isSafeCommand,
+	markCompletedSteps,
+	parseCommand,
+} from "./utils.ts";
 
 const allowed = (command: string) => assert.equal(explainUnsafe(command), undefined, `should be allowed: ${command}`);
 const blocked = (command: string, why?: RegExp) => {
@@ -175,4 +183,25 @@ test("markCompletedSteps only ticks steps that were reported", () => {
 		items.map((i) => i.completed),
 		[false, true],
 	);
+});
+
+test("the plan document is always an approved target", () => {
+	const root = path.join(process.cwd(), "repo");
+	const plan = path.join("docs", "plans", "2026-11-14_screener.md");
+	const files = ["config.py", "vcp/indicators.py"];
+
+	// what broke a real run: ticking steps in the plan that was being executed
+	assert.equal(isApprovedTarget(root, plan, files, plan), true);
+	assert.equal(isApprovedTarget(root, path.resolve(root, plan), files, plan), true);
+	assert.equal(isApprovedTarget(root, "config.py", files, plan), true);
+	assert.equal(isApprovedTarget(root, path.join("vcp", "indicators.py"), files, plan), true);
+	assert.equal(isApprovedTarget(root, "vcp/screen.py", files, plan), false);
+	assert.equal(isApprovedTarget(root, path.join("docs", "plans", "other.md"), files, plan), false);
+});
+
+test("isApprovedTarget does not resolve .. sideways", () => {
+	const root = path.join(process.cwd(), "repo");
+	const files = ["src/a.ts"];
+	assert.equal(isApprovedTarget(root, "src/../src/a.ts", files), true);
+	assert.equal(isApprovedTarget(root, "../outside.ts", files), false);
 });

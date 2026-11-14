@@ -1,25 +1,33 @@
 /**
  * Plan mode — hard-stop planning with a durable artifact.
  *
- * Based on pi's `examples/extensions/plan-mode`, extended in two directions.
+ * Based on pi's `examples/extensions/plan-mode`, extended in four directions.
  *
  * 1. ENFORCEMENT. While planning, `edit` and `write` are not active tools, and `bash` runs only
- *    commands the read-only allowlist recognises. Anything else is put to the human, who may allow
- *    it once, trust the executable for the session, or block it — a gate, not a wall, because a
- *    planner that cannot run one probing command plans from fiction.
+ *    commands the read-only allowlist recognises. What happens to the rest depends on the approval
+ *    mode: `manual` (the default) puts every unrecognised command to the human — run once, trust the
+ *    executable for the session, or block — and `allow-all` runs it without asking. Either way the
+ *    write tools stay off; allow-all is about investigation not being interrupted, not about the
+ *    gate. Only the human switches modes.
  *
  * 2. THE ARTIFACT. `write_plan` is the only way to write a file in plan mode, and it can only write
  *    `docs/plans/YYYY-MM-DD_<slug>.md`. So the plan outlives the session, and the write channel is
  *    one file wide. The filename and the frontmatter are the tool's job, never the model's memory.
  *
+ * 3. THE INTERVIEW. A plan written from assumptions is fiction in a confident voice, so `ask_user`
+ *    exists and `write_plan` refuses until it has been used: two to four questions whose answers
+ *    would change the plan, asked before the investigation, and again when a fork appears.
+ *
  * THE GATE. Nothing executes until a human approves: `/plan go`, or the dialog that appears after a
  * plan is written. Both call `approve()`, and `approve()` is the only code path that restores
  * `edit`/`write`. An extension that restores its own tools is not a gate, it is a log line.
+ * `/plan exit` is the other human exit: keep the plan file, run nothing, continue in a new session.
  *
  * AFTER APPROVAL the plan's declared file list is enforced: `edit`/`write` to a path the plan does
- * not name is blocked, and `/plan allow <path>` extends the set deliberately.
+ * not name is blocked, and `/plan allow <path>` extends the set deliberately. The plan document
+ * itself is always writable — it is the progress ledger.
  *
- * Commands: /plan [on|off|go|allow <path>|trust <command>|status] · /todos · Ctrl+Alt+P
+ * Commands: /plan [on|off|go|exit|allow-all|manual|allow <path>|trust <command>|status] · /todos · Ctrl+Alt+P
  */
 
 import * as fs from "node:fs";
@@ -35,17 +43,26 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { type TodoItem, explainUnsafe, exeNames, markCompletedSteps } from "./utils.ts";
+import { type TodoItem, explainUnsafe, exeNames, isApprovedTarget, markCompletedSteps } from "./utils.ts";
 
 const WRITE_PLAN_TOOL = "write_plan";
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", WRITE_PLAN_TOOL];
+const ASK_TOOL = "ask_user";
+const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", WRITE_PLAN_TOOL, ASK_TOOL];
 const REQUEST_TOOL = "request_plan_mode";
-const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write", REQUEST_TOOL];
+const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write", REQUEST_TOOL, ASK_TOOL];
 const PLAN_MODE_DISABLED_TOOLS = new Set<string>(["edit", "write"]);
 const PLAN_MANAGED_TOOLS = new Set<string>([...PLAN_MODE_TOOLS, ...NORMAL_MODE_TOOLS]);
 
 const PLANS_DIR = path.join("docs", "plans");
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * How an unrecognised bash command is treated while planning.
+ *
+ * `manual` asks the human; `allow-all` does not. The write tools are off in both, so this is a
+ * dial on interruption, not on the gate — and only the human turns it.
+ */
+type ApprovalMode = "manual" | "allow-all";
 
 interface PlanModeState {
 	enabled: boolean;
@@ -54,6 +71,9 @@ interface PlanModeState {
 	planPath?: string;
 	files: string[];
 	awaitingApproval?: boolean;
+	approval?: ApprovalMode;
+	approvalChosen?: boolean;
+	interviewed?: boolean;
 	toolsBeforePlanMode?: string[];
 	/** Executables the human allowed by hand this session (see the plan-mode bash prompt). */
 	sessionAllowed?: string[];
@@ -105,6 +125,9 @@ export default function planExtension(pi: ExtensionAPI): void {
 	let planPath: string | undefined;
 	let files: string[] = [];
 	let awaitingApproval = false;
+	let approval: ApprovalMode = "manual";
+	let approvalChosen = false;
+	let interviewed = false;
 	let toolsBeforePlanMode: string[] | undefined;
 	let sessionAllowed: string[] = [];
 
@@ -128,9 +151,10 @@ export default function planExtension(pi: ExtensionAPI): void {
 			);
 		} else if (enabled) {
 			const trusted = sessionAllowed.length > 0 ? ` +${sessionAllowed.length}` : "";
+			const gate = approval === "allow-all" ? " · allow all" : "";
 			ctx.ui.setStatus(
 				"plan-mode",
-				ctx.ui.theme.fg("warning", (awaitingApproval ? "⏸ plan — awaiting /plan go" : "⏸ plan") + trusted),
+				ctx.ui.theme.fg("warning", (awaitingApproval ? "⏸ plan — awaiting /plan go" : "⏸ plan") + gate + trusted),
 			);
 			ctx.ui.setWidget("plan-todos", undefined);
 		} else {
@@ -165,6 +189,9 @@ export default function planExtension(pi: ExtensionAPI): void {
 			planPath,
 			files,
 			awaitingApproval,
+			approval,
+			approvalChosen,
+			interviewed,
 			toolsBeforePlanMode,
 			sessionAllowed,
 		} satisfies PlanModeState);
@@ -173,10 +200,34 @@ export default function planExtension(pi: ExtensionAPI): void {
 	function enterPlanMode(ctx: ExtensionContext): void {
 		enabled = true;
 		executing = false;
+		awaitingApproval = false;
+		interviewed = false;
 		sessionAllowed = [];
 		enablePlanTools();
 		updateStatus(ctx);
 		persist();
+	}
+
+	/**
+	 * The one question at the start of planning that saves ten later: how should bash be handled?
+	 *
+	 * Asked only when the model opened the gate (the human typing `/plan` does not need to be asked
+	 * what they meant), and only once per session — after that `/plan allow-all` and `/plan manual`
+	 * are the switches. Escape keeps whatever mode is current.
+	 */
+	async function promptApprovalMode(ctx: ExtensionContext): Promise<void> {
+		if (!ctx.hasUI || approvalChosen) return;
+		const manual = "Manual — a command outside the read-only set asks me first";
+		const allow = "Allow all — investigate freely, no command prompts (edit/write stay blocked)";
+		const choice = await ctx.ui.select("Plan mode: how should bash be handled while planning?", [
+			approval === "allow-all" ? allow : manual,
+			approval === "allow-all" ? manual : allow,
+		]);
+		if (!choice) return;
+		approval = choice.startsWith("Allow") ? "allow-all" : "manual";
+		approvalChosen = true;
+		persist();
+		updateStatus(ctx);
 	}
 
 	function leavePlanMode(ctx: ExtensionContext, note = "Plan mode off. Full access restored."): void {
@@ -190,10 +241,38 @@ export default function planExtension(pi: ExtensionAPI): void {
 		persist();
 	}
 
+	/**
+	 * The human's third exit: keep the plan, execute nothing, and hand the work to another session.
+	 *
+	 * Deliberately not the same as approving. The plan stays `draft`, `executing` stays false, so no
+	 * progress tracking and no file-list enforcement follow the agent into normal mode. The user gets
+	 * the one line they need to start the work elsewhere; this session is done with it.
+	 */
+	function exitPlanMode(ctx: ExtensionContext): void {
+		if (!planPath) {
+			ctx.ui.notify("No plan yet — nothing to save. Use /plan off to leave plan mode.", "warning");
+			return;
+		}
+		const rel = planPath.split(path.sep).join("/");
+		enabled = false;
+		executing = false;
+		awaitingApproval = false;
+		sessionAllowed = [];
+		restoreNormalTools();
+		updateStatus(ctx);
+		persist();
+		ctx.ui.notify(
+			`Plan saved: ${rel} — nothing was executed, status stays draft.\n` +
+				`Start a new session and say: execute ${rel}\n` +
+				`(This session has full access again; the plan's file list is not enforced here.)`,
+			"info",
+		);
+	}
+
 	/** The only path that restores write access. Reached from `/plan go` or the dialog, never on its own. */
 	function approve(ctx: ExtensionContext): void {
 		if (!planPath) {
-			ctx.ui.notify("No plan yet. Ask for a plan first — it writes docs/plans/<date>_<slug>.md.", "warn");
+			ctx.ui.notify("No plan yet. Ask for a plan first — it writes docs/plans/<date>_<slug>.md.", "warning");
 			return;
 		}
 		enabled = false;
@@ -212,6 +291,8 @@ export default function planExtension(pi: ExtensionAPI): void {
 
 Approved files (edits outside this list are blocked — ask the user to \`/plan allow <path>\`):
 ${files.map((f) => `- ${f}`).join("\n") || "- (none declared; any edit will be blocked)"}
+
+The plan document itself is always writable: \`${planPath}\` — tick steps there and set \`status: in_progress\`.
 
 Remaining steps:
 ${remaining || "(none extracted — follow the document)"}
@@ -246,6 +327,24 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 			const slug = String(params.slug ?? "").trim();
 			const body = String(params.content ?? "").trim();
 			const declared = (params.files ?? []).map((f: string) => String(f).trim()).filter(Boolean);
+
+			// A plan written from assumptions is fiction in a confident voice. The interview is part of
+			// the deliverable, so the tool refuses without it rather than trusting the prompt to remind.
+			if (!interviewed && ctx.hasUI) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"No interview yet. Call `ask_user` with the two to four questions whose answers would change " +
+								"this plan (scope, inputs, what \"done\" means, the constraint you were about to assume), then " +
+								"write the plan with those answers in it.",
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
 
 			if (!SLUG_RE.test(slug)) {
 				return {
@@ -333,10 +432,133 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 						text:
 							`Wrote ${rel} (${declared.length} file(s) declared, ${todos.length} step(s)).\n\n` +
 							"PLAN MODE STAYS ON. Stop here and summarise the plan in two lines; do not start work. " +
-							"The user approves with /plan go.",
+							"The user approves with /plan go, or saves it with /plan exit to run it in another session.",
 					},
 				],
 				details: { path: rel, files: declared, steps: todos.length },
+			};
+		},
+	});
+
+	// ── the interview ──────────────────────────────────────────────────────────────────────────
+	// A plan is a conversation before it is a document: the model cannot ask four useful questions
+	// in prose and get four usable answers out of one reply. Each question here is a decision point
+	// the human answers on the spot, and the answers land in the transcript where the plan can quote
+	// them. Available in and out of plan mode — asking is never the risky part.
+	pi.registerTool({
+		name: ASK_TOOL,
+		label: "Ask user",
+		description:
+			"Ask the human one to six questions and wait for the answers. Call this before writing a plan — " +
+			"the questions whose answers would change the plan — and again when a fork appears mid-plan, " +
+			"instead of guessing. Every question must carry a `why`: the step, file, or verification line its " +
+			"answer changes. If you cannot name one, the question does not belong in the interview. Options are " +
+			"suggestions: the human can always write their own answer.",
+		executionMode: "sequential",
+		parameters: Type.Object({
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String({ description: "One question, in one sentence" }),
+					header: Type.Optional(Type.String({ description: "Short label, e.g. 'Data source'" })),
+					why: Type.String({
+						description:
+							"What the answer changes: the step, the file list, or the verification line. Shown to the " +
+							"user as 'asked because: …'.",
+					}),
+					options: Type.Optional(
+						Type.Array(Type.String(), { description: "Suggested answers. Omit for a free-text question." }),
+					),
+				}),
+				{ minItems: 1, maxItems: 6 },
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const questions = (params.questions ?? []) as {
+				question: string;
+				header?: string;
+				why?: string;
+				options?: string[];
+			}[];
+			if (questions.length === 0) {
+				return { content: [{ type: "text", text: "No questions to ask." }], details: {}, isError: true };
+			}
+
+			// The justification is the criterion made visible. Validate all of them before asking any, so a bad
+			// third question does not cost the first two answers.
+			for (let i = 0; i < questions.length; i++) {
+				const text = String(questions[i].question ?? "").trim();
+				const why = String(questions[i].why ?? "").trim();
+				if (!text || why) continue;
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Question ${i + 1} ("${text}") has no \`why\`. Name the step, file, or verification line the answer ` +
+								"would change — if you cannot name one, drop the question rather than asking it. Nothing was " +
+								"asked yet.",
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+
+			if (!ctx.hasUI) {
+				// Headless: nothing can be asked, so do not let the artefact gate deadlock.
+				interviewed = true;
+				persist();
+				return {
+					content: [{ type: "text", text: "No UI to put a dialog in — ask these in prose, then plan." }],
+					details: { asked: questions.length },
+					isError: true,
+				};
+			}
+
+			const answers: string[] = [];
+			let cancelled = false;
+			for (const q of questions) {
+				const text = String(q.question ?? "").trim();
+				if (!text) continue;
+				const why = String(q.why ?? "").trim();
+				const label = q.header ? `${q.header}: ${text}` : text;
+				const options = (q.options ?? []).map((o) => String(o).trim()).filter(Boolean);
+				const title = [q.header, text, "", `asked because: ${why}`].filter((line) => line !== undefined).join("\n");
+
+				let answer: string | undefined;
+				if (options.length === 0) {
+					answer = await ctx.ui.input(title);
+				} else {
+					const own = "Other — I'll type it";
+					const choice = await ctx.ui.select(title, [...options, own]);
+					answer = choice === own ? await ctx.ui.input(title) : choice;
+				}
+
+				if (!answer || !answer.trim()) {
+					cancelled = true;
+					answers.push(`${label}\n  asked because: ${why}\n  → (cancelled — the questions stopped here)`);
+					break;
+				}
+				answers.push(`${label}\n  asked because: ${why}\n  → ${answer.trim()}`);
+			}
+
+			if (answers.length > 0) {
+				interviewed = true;
+				persist();
+			}
+
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Answers:\n${answers.join("\n")}\n\n` +
+							(cancelled
+								? "The user stopped the questions. Plan with what you have and put what is still unknown under Open questions; do not ask again in this turn."
+								: "Neither invent answers nor ask again: write the plan now, with these answers in it, and let them show in the plan's Context."),
+					},
+				],
+				details: { asked: questions.length, answered: answers.length },
 			};
 		},
 	});
@@ -367,24 +589,29 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 				return { content: [{ type: "text", text: "Already in plan mode — investigate, then write_plan, then stop." }], details: {} };
 			}
 			enterPlanMode(ctx);
+			await promptApprovalMode(ctx);
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Plan mode on${params.reason ? ` (${params.reason})` : ""}. Read-only: edit and write are gone, bash is ` +
-							"restricted. Read AGENTS.md and the files that will change, then write_plan with the document " +
-							"convention from the `plan` skill, then stop.",
+							`Plan mode on${params.reason ? ` (${params.reason})` : ""}. Read-only: edit and write are gone` +
+							(approval === "allow-all" ? ", and bash runs without asking" : ", and bash runs read-only commands without asking") +
+							`.\n\nFIRST: call \`${ASK_TOOL}\` with the two to four questions whose answers would change the plan, ` +
+							"each with a `why` naming the step, file, or verification line it changes. Then read AGENTS.md and " +
+							"the files that will change, write the plan with the document convention from the `plan` skill, and " +
+							"stop. (write_plan refuses until you have asked.)",
 					},
 				],
-				details: { enabled: true },
+				details: { enabled: true, approval },
 			};
 		},
 	});
 
 	// ── commands ────────────────────────────────────────────────────────────────────────────────
 	pi.registerCommand("plan", {
-		description: "Plan mode: on | off | go | allow <path> | trust <command> | status (no argument toggles)",
+		description:
+			"Plan mode: on | off | go | exit | allow-all | manual | allow <path> | trust <command> | status (no argument toggles)",
 		handler: async (args, ctx) => {
 			const [sub, ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const arg = rest.join(" ");
@@ -392,12 +619,33 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 				case "go":
 				case "approve":
 					return approve(ctx);
+				case "exit":
+				case "save":
+					return exitPlanMode(ctx);
 				case "on":
 					return enabled ? ctx.ui.notify("Already in plan mode.", "info") : enterPlanMode(ctx);
 				case "off":
 					return enabled ? leavePlanMode(ctx) : ctx.ui.notify("Not in plan mode.", "info");
+				case "allow-all":
+				case "all": {
+					approval = "allow-all";
+					approvalChosen = true;
+					persist();
+					updateStatus(ctx);
+					return ctx.ui.notify(
+						"Allow-all: while planning, bash no longer asks (edit/write still blocked, /plan go still gates execution).",
+						"info",
+					);
+				}
+				case "manual": {
+					approval = "manual";
+					approvalChosen = true;
+					persist();
+					updateStatus(ctx);
+					return ctx.ui.notify("Manual approval: a command outside the read-only allowlist asks you first.", "info");
+				}
 				case "allow": {
-					if (!arg) return ctx.ui.notify("Usage: /plan allow <path>", "warn");
+					if (!arg) return ctx.ui.notify("Usage: /plan allow <path>", "warning");
 					files = unique([...files, arg.split(path.sep).join("/")]);
 					persist();
 					ctx.ui.notify(`Approved path added: ${arg}`, "info");
@@ -418,6 +666,8 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 				case "status": {
 					const lines = [
 						`mode: ${enabled ? "plan (read-only)" : executing ? "executing" : "normal"}`,
+						`approval: ${approval}${enabled ? "" : " (applies while planning)"}`,
+						`interview: ${interviewed ? "asked" : "not asked yet (write_plan will refuse)"}`,
 						`plan: ${planPath ?? "none"}`,
 						`files: ${files.length ? files.join(", ") : "none declared"}`,
 						`steps: ${todos.filter((t) => t.completed).length}/${todos.length} done`,
@@ -454,10 +704,11 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 		// 1. Planning: bash is read-only by default, and a human may step it up for one command.
 		//    The gate is human judgement, so a research command the allowlist does not recognise is a
 		//    question, not a dead end. Without a UI there is nobody to ask, so it stays blocked.
+		//    In allow-all mode the question is skipped; the write tools stay off either way.
 		if (enabled && event.toolName === "bash") {
 			const command = String(event.input.command ?? "");
 			const why = explainUnsafe(command);
-			if (why) {
+			if (why && approval === "manual") {
 				const names = exeNames(command);
 				const trusted = names.length > 0 && names.every((n) => sessionAllowed.includes(n));
 				if (!trusted) {
@@ -492,27 +743,26 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 			};
 		}
 
-		// 3. Executing: only the paths the approved plan declared.
+		// 3. Executing: only the paths the approved plan declared — plus the plan document itself,
+		//    which is the progress ledger and must stay writable or the run cannot tick its steps.
 		if (executing && (isToolCallEventType("write", event) || isToolCallEventType("edit", event))) {
 			const target = String(event.input.path ?? "");
 			if (!target) return;
+			const root = cwdOf(ctx);
+			if (isApprovedTarget(root, target, files, planPath)) return;
 			if (files.length === 0) {
 				return {
 					block: true,
 					reason: "The approved plan declared no files. Ask the user to /plan allow <path> before editing.",
 				};
 			}
-			const root = cwdOf(ctx);
-			const abs = path.resolve(root, target);
-			const allowed = files.some((f) => path.resolve(root, f) === abs);
-			if (!allowed) {
-				return {
-					block: true,
-					reason:
-						`${target} is not in the approved plan (${files.join(", ")}). Either add it to the plan and get it ` +
-						"approved, or ask the user to /plan allow " + target,
-				};
-			}
+			return {
+				block: true,
+				reason:
+					`${target} is not in the approved plan (${files.join(", ")}; the plan document ${planPath} is ` +
+					"always writable). Either add it to the plan and get it approved, or ask the user to /plan allow " +
+					target,
+			};
 		}
 	});
 
@@ -538,27 +788,41 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 		if (event.messageType !== "user") return;
 
 		if (enabled) {
+			const bashPolicy =
+				approval === "allow-all"
+					? "\nBash runs without asking this session: run whatever investigation you need. The write tools stay off.\n"
+					: [
+						"",
+						"Bash runs read-only commands without asking. If a command you need is outside that set — a test",
+						"run, a script, a build — run it anyway: the human is asked whether to allow it, and their",
+						"answer is the policy. A refusal means 'find another way', not 'try a variant of the same command'.",
+						"",
+					].join("\n");
 			return {
 				message: {
 					customType: "plan-mode-context",
-					content: `[PLAN MODE ACTIVE — read-only]
+					content: `[PLAN MODE ACTIVE — read-only${approval === "allow-all" ? ", allow-all" : ", manual approval"}]
 
-You are planning, not building. \`edit\` and \`write\` are not available, and bash runs read-only
-commands without asking: reading, searching, git log/diff/show, and the like.
+You are planning, not building. \`edit\` and \`write\` are not available.
 
-Investigating is expected. If a command you need is outside that set — a test run, a script, a
-build — run it anyway: the human is asked whether to allow it, and their answer is the policy.
-A refusal means "find another way", not "try a variant of the same command".
-
+INTERVIEW FIRST. Before you investigate deeply, call \`${ASK_TOOL}\` with the two to four questions whose
+answers would actually change the plan — scope, the inputs, what "done" means, the constraint you
+were about to assume. **Each question needs a \`why\`**: the step, file, or verification line its
+answer changes, which the user sees as "asked because: …". If you cannot name one, drop the question.
+Reading a file or two first to make the questions concrete is fine; planning on
+an unasked assumption is not. ${WRITE_PLAN_TOOL} refuses until you have asked, which is deliberate.
+${bashPolicy}
 Do this, in order:
-1. Read the project's AGENTS.md, then the files that will change. State your assumptions.
-2. If the request is ambiguous in a way that changes the plan, ask — do not guess.
-3. Write the plan with the \`write_plan\` tool. The \`plan\` skill holds the document convention; the
-   tool enforces what it can (ISO-dated filename, frontmatter, numbered \`## Steps\`).
+1. Interview (\`${ASK_TOOL}\`), then read the project's AGENTS.md and the files that will change.
+   State your assumptions explicitly — one you write down is a question someone can answer.
+2. If a fork appears whose branches differ materially, ask again rather than picking one quietly.
+3. Write the plan with the \`${WRITE_PLAN_TOOL}\` tool. The \`plan\` skill holds the document convention;
+   the tool enforces what it can (ISO-dated filename, frontmatter, numbered \`## Steps\`).
    Pass every file you intend to edit in \`files\`; after approval those are the only paths you may touch.
 4. Then STOP. Two lines of summary, no work.
 
-Do not begin implementing. The user approves with /plan go.`,
+Do not begin implementing. The user approves with /plan go, or saves the plan with /plan exit to run
+it in a different session.`,
 					display: false,
 				},
 			};
@@ -569,7 +833,7 @@ Do not begin implementing. The user approves with /plan go.`,
 			return {
 				message: {
 					customType: "plan-execution-context",
-					content: `[EXECUTING PLAN — access to the approved files only]\n\nPlan: ${planPath}\n\nRemaining steps:\n${remaining}\n\nExecute in order. After each step include [DONE:n]. Stay inside the approved files.`,
+					content: `[EXECUTING PLAN — access to the approved files only]\n\nPlan: ${planPath}\n\nRemaining steps:\n${remaining}\n\nExecute in order. After each step include [DONE:n]. Stay inside the approved files; the plan document itself (${planPath}) is always writable, so tick steps and set \`status: in_progress\` there. If a step turns out to be wrong or a fork appears mid-way, call ${ASK_TOOL} rather than diverging quietly.`,
 					display: false,
 				},
 			};
@@ -600,10 +864,12 @@ Do not begin implementing. The user approves with /plan go.`,
 		if (!enabled || !awaitingApproval || !ctx.hasUI) return;
 		const choice = await ctx.ui.select("Plan written. What next?", [
 			"Approve and execute (/plan go)",
-			"Stay in plan mode",
+			"Save and exit — implement it in a new session (/plan exit)",
 			"Refine the plan",
+			"Stay in plan mode",
 		]);
 		if (choice?.startsWith("Approve")) approve(ctx);
+		else if (choice?.startsWith("Save and exit")) exitPlanMode(ctx);
 		else if (choice === "Refine the plan") {
 			const refinement = await ctx.ui.editor("Refine the plan:", "");
 			if (refinement?.trim()) pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
@@ -625,6 +891,9 @@ Do not begin implementing. The user approves with /plan go.`,
 			planPath = last.data.planPath;
 			files = last.data.files ?? [];
 			awaitingApproval = last.data.awaitingApproval ?? false;
+			approval = last.data.approval ?? "manual";
+			approvalChosen = last.data.approvalChosen ?? false;
+			interviewed = last.data.interviewed ?? false;
 			toolsBeforePlanMode = last.data.toolsBeforePlanMode;
 			sessionAllowed = last.data.sessionAllowed ?? [];
 		}

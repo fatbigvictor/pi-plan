@@ -3,6 +3,8 @@
  * Extracted for testability — see utils.test.ts.
  */
 
+import * as path from "node:path";
+
 /**
  * Plan mode's read-only gate.
  *
@@ -421,6 +423,20 @@ export function explainUnsafe(command: string): string | undefined {
 
 export function isSafeCommand(command: string): boolean {
 	return explainUnsafe(command) === undefined;
+}
+
+/**
+ * Whether an `edit`/`write` target is inside the approved plan.
+ *
+ * The plan document itself is always allowed. It is the progress ledger — ticking a step and
+ * setting `status: in_progress` is what the document is for — and making the agent stop and ask
+ * `/plan allow docs/plans/<the plan>` to update its own plan was a papercut that stalled a real
+ * run. Declared files and the plan document, nothing else.
+ */
+export function isApprovedTarget(root: string, target: string, approved: string[], planPath?: string): boolean {
+	const abs = path.resolve(root, target);
+	if (planPath && path.resolve(root, planPath) === abs) return true;
+	return approved.some((f) => path.resolve(root, f) === abs);
 }
 
 export interface TodoItem {
