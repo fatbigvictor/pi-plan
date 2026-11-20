@@ -43,6 +43,12 @@ The plan is a conversation before it is a document. Start with `ask_user`, befor
 **two to four questions whose answers would change the plan**, not a checklist of everything you
 could know.
 
+The count is a ceiling, not a quota: **one question per open fork that would change a file, a step,
+or a `Verify:` line.** The mechanism requires at least one (`write_plan` refuses until `ask_user` has
+run), so when nothing is genuinely open, spend it on the assumption you were about to make silently.
+Grilling is not a precondition either: if an earlier interview already pinned the design, these
+questions are for what it left open, not a re-run.
+
 **Every question carries a `why`**, and the user sees it as `asked because: …`. The `why` is the test
 made visible: name the step, the file in `files:`, or the verification line the answer changes. If you
 cannot name one, drop the question — the tool refuses to ask it for you.
@@ -67,11 +73,23 @@ question per file is a conversation you should be having in prose instead.
 ## When it fires
 
 Say yes to: *"plan how to add X"*, *"what's the approach for migrating Y"*, *"write a plan"*,
-*"how should we build this"* — anything where the change touches more than one file, or where a
-wrong guess costs real work.
+*"how should we build this"* — an explicit request is the strongest signal there is.
 
-Say no to: a one-line change, a question ("why is this test red?"), a review, or an explanation. If
-the work is small enough that the plan is longer than the diff, just do the work. **Plan mode is a
+Everything else is decided, not felt. Ask these in order and stop at the first **yes**:
+
+1. **Is it irreversible or expensive to undo?** A migration, a data backfill, a destructive script, a
+   deploy, a change other branches depend on. Reversibility, not file count, is the real test.
+2. **Must it be reconstructable from something other than this chat?** Work that spans sessions, is
+   handed over, or whose *order* a later reader will question.
+3. **Is a wrong guess costly?** If the mistake surfaces at step 4 and means throwing away steps 1–3
+   rather than editing one file, it needed the gate.
+4. **Can you name the `files:` yet?** If a short read does not produce the file list, you do not know
+   the change well enough to execute it either.
+
+Four noes mean execute directly, in vertical slices with a checkpoint after the first testable one.
+That covers the small work: a one-line change, a question ("why is this test red?"), a review, an
+explanation. **Multi-file is a proxy, not a reason** — a route, a page, and a readme is four files
+and one revert. And if the plan would be longer than the diff, just do the work. **Plan mode is a
 signal, not an inference** — if it is on, plan; if it is not, don't perform planning theatre.
 
 **If plan mode is off and the work needs a plan, call `request_plan_mode` first** — that tool puts
