@@ -13,12 +13,17 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import {
+	clearedInterview,
+	consumeInterview,
+	deriveInterviewState,
 	explainUnsafe,
 	exeNames,
+	hasUsableInterview,
 	isApprovedTarget,
 	isSafeCommand,
 	markCompletedSteps,
 	parseCommand,
+	recordInterview,
 } from "./utils.ts";
 
 const allowed = (command: string) => assert.equal(explainUnsafe(command), undefined, `should be allowed: ${command}`);
@@ -197,6 +202,45 @@ test("the plan document is always an approved target", () => {
 	assert.equal(isApprovedTarget(root, path.join("vcp", "indicators.py"), files, plan), true);
 	assert.equal(isApprovedTarget(root, "vcp/screen.py", files, plan), false);
 	assert.equal(isApprovedTarget(root, path.join("docs", "plans", "other.md"), files, plan), false);
+});
+
+test("a recorded interview is usable until it is consumed or cleared", () => {
+	const fresh = clearedInterview();
+	assert.equal(hasUsableInterview(fresh), false);
+
+	const asked = recordInterview(fresh, 3, 3);
+	assert.deepEqual(asked, { asked: 3, answered: 3, available: true });
+	assert.equal(hasUsableInterview(asked), true);
+
+	// entering plan mode must not discard a carried interview: the transition is identity
+	const consumed = consumeInterview(asked);
+	assert.equal(hasUsableInterview(consumed), false);
+	assert.equal(consumed.answered, 3); // counts survive for /plan status
+
+	assert.equal(hasUsableInterview(clearedInterview()), false);
+});
+
+test("an interview with no answers records nothing usable", () => {
+	const fresh = clearedInterview();
+	assert.equal(hasUsableInterview(recordInterview(fresh, 2, 0)), false);
+	// a cancelled round still counts the answers that were actually given
+	assert.equal(hasUsableInterview(recordInterview(fresh, 4, 1)), true);
+});
+
+test("recorded interviews accumulate counts across rounds", () => {
+	const first = recordInterview(clearedInterview(), 2, 2);
+	const second = recordInterview(first, 1, 1);
+	assert.deepEqual(second, { asked: 3, answered: 3, available: true });
+});
+
+test("legacy persisted state derives a usable interview", () => {
+	// 0.2.0 sessions persist only `interviewed: boolean`
+	assert.equal(hasUsableInterview(deriveInterviewState(true, undefined)), true);
+	assert.equal(hasUsableInterview(deriveInterviewState(false, undefined)), false);
+	assert.equal(hasUsableInterview(deriveInterviewState(undefined, undefined)), false);
+	// new state wins over the legacy flag in both directions
+	assert.equal(hasUsableInterview(deriveInterviewState(true, { asked: 1, answered: 1, available: false })), false);
+	assert.equal(hasUsableInterview(deriveInterviewState(false, { asked: 1, answered: 1, available: true })), true);
 });
 
 test("isApprovedTarget does not resolve .. sideways", () => {

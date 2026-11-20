@@ -1,11 +1,25 @@
 # pi-plan
 
-Hard-stop plan mode for [pi](https://github.com/earendil-works/pi). Read-only while planning, the
-plan is a file that outlives the session, and **nothing executes until a human approves**.
+A unified delivery workflow for [pi](https://github.com/earendil-works/pi), backed by hard-stop
+plan mode. Read-only while planning, the plan is a file that outlives the session, and **nothing
+executes until a human approves**.
 
 ```bash
 pi install git:github.com/fatbigvictor/pi-plan
 ```
+
+## The deliver workflow
+
+Every implementation request is triaged the way a programmer would take it on: **study** the
+scope, **classify** and announce it, **interview** what is undecided, **summarise** the shared
+understanding, then let a **risk test** pick the artefact before **executing**. Two independent
+dials drive it — *uncertainty* (how many decision forks are open) sets the question budget, in
+grilling style with a recommended answer for each; *risk* (irreversible or expensive to undo,
+must outlive the chat, costly wrong guess, file list not yet nameable) decides between working
+directly, an inline mini-plan confirmed in chat, and a formal plan under the gate below. Small
+clear tasks short-circuit straight to work; decision-only grilling ("grill me", "stress-test
+this") ends at the shared understanding with nothing built. The `deliver` skill holds the full
+workflow; the rest of this README is the enforcement it stands on when the risk test fires.
 
 ## Planning is investigative
 
@@ -26,12 +40,15 @@ the gate.
 ## The interview comes before the plan
 
 A plan written from assumptions is fiction in a confident voice, so the `ask_user` tool exists and
-`write_plan` **refuses until it has been used**: two to four questions whose answers would change the
+`write_plan` **refuses until an interview is usable**: the questions whose answers would change the
 plan — scope, inputs, what "done" means, the constraint you were about to assume. Each question
 carries a `why`, shown as `asked because: …`: the step, file, or verification line its answer
-changes. No justification, no question. Mid-way, when a fork appears whose branches differ
-materially, the agent is told to ask again instead of picking one quietly. Answer with an option, or
-type your own; one Escape stops the round.
+changes. No justification, no question. The interview normally happens during triage, before plan
+mode is even entered, and it **carries in**: entering plan mode does not discard it, a successful
+`write_plan` consumes it, and leaving the gate (`/plan go`, `/plan exit`, plan mode off) clears it,
+so one task's answers can never satisfy another task's plan. Mid-way, when a fork appears whose
+branches differ materially, the agent is told to ask again instead of picking one quietly. Answer
+with an option, or type your own; one Escape stops the round.
 
 ## Why this exists
 
@@ -44,7 +61,8 @@ would do. Two mechanisms fix that, and they are different mechanisms:
 - **an artifact** — the plan is a file in the repo, so a later session, a reviewer, or you in a
   week can read what was decided and why.
 
-This package ships both: the `plan` extension for the first, the `plan` skill for the second.
+This package ships both: the `plan` extension for the first, and the `deliver` skill for the
+second — the workflow that decides, per request, which of the two a task actually needs.
 
 ## What it enforces
 
@@ -53,7 +71,7 @@ This package ships both: the `plan` extension for the first, the `plan` skill fo
 | `edit` / `write` unusable | removed from the active tool set **and** blocked in the `tool_call` interceptor |
 | `bash` read-only by default | every segment's executable must be on the read-only allowlist; no `rm`, `mv`, `git commit`, `npm install`, editors, redirection, or substitution |
 | anything else is a question — or not, in allow-all | `tool_call` interceptor; the human picks the mode |
-| the plan is written from answers | `write_plan` refuses until `ask_user` has been used, and every question must name what its answer changes |
+| the plan is written from answers | `write_plan` refuses until an interview is usable (asked in plan mode, or carried unconsumed from earlier in the session), and every question must name what its answer changes |
 | the plan is a file | `write_plan` is the only write channel, and only writes `docs/plans/YYYY-MM-DD_<slug>.md` |
 | nothing runs early | `edit`/`write` return only from `approve()` — `/plan go`, or the dialog |
 | edits stay in scope | after approval, edits outside the plan's declared `files` are blocked; the plan document itself is always writable |
@@ -113,14 +131,15 @@ Filename and frontmatter are the tool's job, never the model's memory. A written
 a revision is a new file with `supersedes:`. `## Steps` drives the progress widget; `[DONE:n]`
 marks completion. While the plan is current the document is mutable — that is how steps get ticked
 and `status:` moves — and it is writable without being declared in `files:`.
-The `plan` skill holds the full convention — one verification line per step, the
-status lifecycle, and how a later session resumes.
+The `deliver` skill holds the full convention — one verification line per step, the
+status lifecycle, and how a later session resumes. (Before 0.3.0 this was the `plan` skill;
+`/skill:plan` references should now use `/skill:deliver`.)
 
 ## Layout
 
 ```text
 extensions/plan/    the extension (index.ts + utils.ts — both required)
-skills/plan/        the document convention
+skills/deliver/     the unified workflow: triage, interview, risk test, document convention
 ```
 
 The extension imports only `node:fs`, `node:path`, and type/class references that pi resolves to
@@ -132,7 +151,7 @@ its own copies (`pi-coding-agent`, `pi-tui`, `typebox`). There is nothing to `np
 `extensions/plan/utils.ts` and the shape of the read-only tool set come from pi's own
 `examples/extensions/plan-mode`. What is added here: the `write_plan` artifact tool, the approval
 gate (`/plan go`), approved-file-set enforcement, `request_plan_mode`, the `ask_user` interview and
-its gate, the two approval modes, and `/plan exit`.
+its gate (including interview carry-over from triage), the two approval modes, and `/plan exit`.
 
 ## Licence
 

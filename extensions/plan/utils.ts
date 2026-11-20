@@ -439,6 +439,60 @@ export function isApprovedTarget(root: string, target: string, approved: string[
 	return approved.some((f) => path.resolve(root, f) === abs);
 }
 
+/**
+ * Interview state for the plan gate.
+ *
+ * `ask_user` is available outside plan mode, so an interview can happen before the gate is
+ * entered (the unified deliver workflow interviews during triage, then enters plan mode only
+ * when the risk test fires). Entering plan mode must therefore not discard an interview that
+ * already happened: it stays `available` until a successful `write_plan` consumes it, and it is
+ * cleared when the human leaves the gate (`/plan go`, `/plan exit`, or plan mode off), so one
+ * task's answers can never silently satisfy another task's plan. Only counts are kept — the
+ * questions and answers themselves live in the session transcript.
+ */
+export interface InterviewState {
+	asked: number;
+	answered: number;
+	available: boolean;
+}
+
+export function clearedInterview(): InterviewState {
+	return { asked: 0, answered: 0, available: false };
+}
+
+/** Record a finished `ask_user` round. A round with no answers makes nothing usable. */
+export function recordInterview(state: InterviewState, asked: number, answered: number): InterviewState {
+	if (answered <= 0) return state;
+	return { asked: state.asked + asked, answered: state.answered + answered, available: true };
+}
+
+/** A successful `write_plan` spends the interview: the next plan needs a fresh one. */
+export function consumeInterview(state: InterviewState): InterviewState {
+	return { ...state, available: false };
+}
+
+export function hasUsableInterview(state: InterviewState): boolean {
+	return state.available;
+}
+
+/**
+ * Restore interview state from a persisted entry. 0.2.0 sessions carry only the legacy
+ * `interviewed` boolean; new state, when present, wins over it in both directions.
+ */
+export function deriveInterviewState(
+	legacyInterviewed: boolean | undefined,
+	interview: Partial<InterviewState> | undefined,
+): InterviewState {
+	if (interview) {
+		return {
+			asked: interview.asked ?? 0,
+			answered: interview.answered ?? 0,
+			available: interview.available ?? false,
+		};
+	}
+	return legacyInterviewed ? { asked: 0, answered: 0, available: true } : clearedInterview();
+}
+
 export interface TodoItem {
 	step: number;
 	text: string;

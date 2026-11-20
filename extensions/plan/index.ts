@@ -15,8 +15,10 @@
  *    one file wide. The filename and the frontmatter are the tool's job, never the model's memory.
  *
  * 3. THE INTERVIEW. A plan written from assumptions is fiction in a confident voice, so `ask_user`
- *    exists and `write_plan` refuses until it has been used: two to four questions whose answers
- *    would change the plan, asked before the investigation, and again when a fork appears.
+ *    exists and `write_plan` refuses until it has been used. An interview run earlier in the same
+ *    session (the deliver workflow interviews during triage, before the gate is entered) counts:
+ *    entering plan mode does not discard it. A successful `write_plan` consumes it, and leaving
+ *    the gate clears it, so one task's answers cannot satisfy another task's plan.
  *
  * THE GATE. Nothing executes until a human approves: `/plan go`, or the dialog that appears after a
  * plan is written. Both call `approve()`, and `approve()` is the only code path that restores
@@ -43,7 +45,19 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { type TodoItem, explainUnsafe, exeNames, isApprovedTarget, markCompletedSteps } from "./utils.ts";
+import {
+	type InterviewState,
+	type TodoItem,
+	clearedInterview,
+	consumeInterview,
+	deriveInterviewState,
+	explainUnsafe,
+	exeNames,
+	hasUsableInterview,
+	isApprovedTarget,
+	markCompletedSteps,
+	recordInterview,
+} from "./utils.ts";
 
 const WRITE_PLAN_TOOL = "write_plan";
 const ASK_TOOL = "ask_user";
@@ -73,7 +87,9 @@ interface PlanModeState {
 	awaitingApproval?: boolean;
 	approval?: ApprovalMode;
 	approvalChosen?: boolean;
+	/** Legacy (0.2.0) flag; still written, derived from `interview`, so old readers keep working. */
 	interviewed?: boolean;
+	interview?: InterviewState;
 	toolsBeforePlanMode?: string[];
 	/** Executables the human allowed by hand this session (see the plan-mode bash prompt). */
 	sessionAllowed?: string[];
@@ -127,7 +143,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 	let awaitingApproval = false;
 	let approval: ApprovalMode = "manual";
 	let approvalChosen = false;
-	let interviewed = false;
+	let interview: InterviewState = clearedInterview();
 	let toolsBeforePlanMode: string[] | undefined;
 	let sessionAllowed: string[] = [];
 
@@ -191,7 +207,8 @@ export default function planExtension(pi: ExtensionAPI): void {
 			awaitingApproval,
 			approval,
 			approvalChosen,
-			interviewed,
+			interviewed: interview.available,
+			interview,
 			toolsBeforePlanMode,
 			sessionAllowed,
 		} satisfies PlanModeState);
@@ -201,7 +218,8 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = true;
 		executing = false;
 		awaitingApproval = false;
-		interviewed = false;
+		// An interview from earlier this session survives entry: it is spent by write_plan or
+		// cleared when the gate is left, never by walking through the gate's door.
 		sessionAllowed = [];
 		enablePlanTools();
 		updateStatus(ctx);
@@ -234,6 +252,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = false;
 		executing = false;
 		awaitingApproval = false;
+		interview = clearedInterview();
 		sessionAllowed = [];
 		restoreNormalTools();
 		ctx.ui.notify(note, "info");
@@ -257,6 +276,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = false;
 		executing = false;
 		awaitingApproval = false;
+		interview = clearedInterview();
 		sessionAllowed = [];
 		restoreNormalTools();
 		updateStatus(ctx);
@@ -278,6 +298,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 		enabled = false;
 		executing = true;
 		awaitingApproval = false;
+		interview = clearedInterview();
 		sessionAllowed = []; // the step-up list was for planning; execution has full access
 		restoreNormalTools();
 		updateStatus(ctx);
@@ -330,7 +351,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 
 			// A plan written from assumptions is fiction in a confident voice. The interview is part of
 			// the deliverable, so the tool refuses without it rather than trusting the prompt to remind.
-			if (!interviewed && ctx.hasUI) {
+			if (!hasUsableInterview(interview) && ctx.hasUI) {
 				return {
 					content: [
 						{
@@ -422,6 +443,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 			files = declared;
 			todos = steps;
 			awaitingApproval = true;
+			interview = consumeInterview(interview); // this plan spent the interview
 			persist();
 
 			const rel = planPath.split(path.sep).join("/");
@@ -506,7 +528,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 
 			if (!ctx.hasUI) {
 				// Headless: nothing can be asked, so do not let the artefact gate deadlock.
-				interviewed = true;
+				interview = recordInterview(interview, questions.length, questions.length);
 				persist();
 				return {
 					content: [{ type: "text", text: "No UI to put a dialog in — ask these in prose, then plan." }],
@@ -543,7 +565,8 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 			}
 
 			if (answers.length > 0) {
-				interviewed = true;
+				const answered = answers.filter((a) => !a.includes("(cancelled")).length;
+				interview = recordInterview(interview, questions.length, answered);
 				persist();
 			}
 
@@ -569,9 +592,10 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 		name: REQUEST_TOOL,
 		label: "Request plan mode",
 		description:
-			"Switch to read-only plan mode. Call this FIRST, before any investigation, when the user asks for a " +
-			"plan, an approach, or how to build something. edit/write are then unavailable, so you must investigate " +
-			"and then call write_plan and stop. Only the user can leave plan mode (/plan go).",
+			"Switch to read-only plan mode. Call this when the user asks for a plan, an approach, or how to build " +
+			"something, or when the deliver workflow's risk test fires — a short scope study may come first. " +
+			"edit/write are then unavailable, so you must investigate and then call write_plan and stop. Only " +
+			"the user can leave plan mode (/plan go).",
 		parameters: Type.Object({
 			reason: Type.Optional(Type.String({ description: "One line: what is being planned" })),
 		}),
@@ -590,6 +614,15 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 			}
 			enterPlanMode(ctx);
 			await promptApprovalMode(ctx);
+			const interviewGuidance = hasUsableInterview(interview)
+				? `An interview from earlier this session is carried (${interview.answered} answered): do not re-ask ` +
+					"what it settled. Ask again only if a fork it left open would change the plan. Read AGENTS.md and " +
+					"the files that will change, then write the plan with the document convention from the `deliver` " +
+					"skill, with the interview answers in its Context, and stop."
+				: `FIRST: read AGENTS.md and a file or two so the questions are concrete, then call \`${ASK_TOOL}\` ` +
+					"with the questions whose answers would change the plan, each with a `why` naming the step, file, " +
+					"or verification line it changes. Then read the files that will change, write the plan with the " +
+					"document convention from the `deliver` skill, and stop. (write_plan refuses until you have asked.)";
 			return {
 				content: [
 					{
@@ -597,10 +630,7 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 						text:
 							`Plan mode on${params.reason ? ` (${params.reason})` : ""}. Read-only: edit and write are gone` +
 							(approval === "allow-all" ? ", and bash runs without asking" : ", and bash runs read-only commands without asking") +
-							`.\n\nFIRST: call \`${ASK_TOOL}\` with the two to four questions whose answers would change the plan, ` +
-							"each with a `why` naming the step, file, or verification line it changes. Then read AGENTS.md and " +
-							"the files that will change, write the plan with the document convention from the `plan` skill, and " +
-							"stop. (write_plan refuses until you have asked.)",
+							`.\n\n${interviewGuidance}`,
 					},
 				],
 				details: { enabled: true, approval },
@@ -667,7 +697,13 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 					const lines = [
 						`mode: ${enabled ? "plan (read-only)" : executing ? "executing" : "normal"}`,
 						`approval: ${approval}${enabled ? "" : " (applies while planning)"}`,
-						`interview: ${interviewed ? "asked" : "not asked yet (write_plan will refuse)"}`,
+						`interview: ${
+							hasUsableInterview(interview)
+								? `asked (${interview.answered} answered, carried — write_plan will accept it)`
+								: interview.answered > 0
+									? `asked (${interview.answered} answered, consumed — a new plan asks again)`
+									: "not asked yet (write_plan will refuse)"
+						}`,
 						`plan: ${planPath ?? "none"}`,
 						`files: ${files.length ? files.join(", ") : "none declared"}`,
 						`steps: ${todos.filter((t) => t.completed).length}/${todos.length} done`,
@@ -788,6 +824,25 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 		if (event.messageType !== "user") return;
 
 		if (enabled) {
+			const interviewPolicy = hasUsableInterview(interview)
+				? [
+						"",
+						`INTERVIEW ALREADY DONE (${interview.answered} answered earlier this session, carried into plan`,
+						"mode). Do not re-ask what it settled; the answers belong in the plan's Context. Ask again only",
+						"when a fork it left open would change a file, a step, or a verification line.",
+						"",
+					].join("\n")
+				: [
+						"",
+						"INTERVIEW BEFORE WRITING. A quick scope read first is fine — AGENTS.md and a file or two so",
+						`the questions are concrete — then call \`${ASK_TOOL}\` with the questions whose answers would`,
+						"actually change the plan: scope, the inputs, what \"done\" means, the constraint you were about",
+						"to assume. **Each question needs a `why`**: the step, file, or verification line its answer",
+						"changes, which the user sees as \"asked because: …\". If you cannot name one, drop the question.",
+						`Planning on an unasked assumption is not allowed. ${WRITE_PLAN_TOOL} refuses until you have`,
+						"asked, which is deliberate.",
+						"",
+					].join("\n");
 			const bashPolicy =
 				approval === "allow-all"
 					? "\nBash runs without asking this session: run whatever investigation you need. The write tools stay off.\n"
@@ -804,19 +859,12 @@ Update the plan's status to \`in_progress\` and tick steps as you go. After fini
 					content: `[PLAN MODE ACTIVE — read-only${approval === "allow-all" ? ", allow-all" : ", manual approval"}]
 
 You are planning, not building. \`edit\` and \`write\` are not available.
-
-INTERVIEW FIRST. Before you investigate deeply, call \`${ASK_TOOL}\` with the two to four questions whose
-answers would actually change the plan — scope, the inputs, what "done" means, the constraint you
-were about to assume. **Each question needs a \`why\`**: the step, file, or verification line its
-answer changes, which the user sees as "asked because: …". If you cannot name one, drop the question.
-Reading a file or two first to make the questions concrete is fine; planning on
-an unasked assumption is not. ${WRITE_PLAN_TOOL} refuses until you have asked, which is deliberate.
-${bashPolicy}
+${interviewPolicy}${bashPolicy}
 Do this, in order:
-1. Interview (\`${ASK_TOOL}\`), then read the project's AGENTS.md and the files that will change.
+1. Interview (\`${ASK_TOOL}\`) unless one is carried from earlier this session, then read the project's AGENTS.md and the files that will change.
    State your assumptions explicitly — one you write down is a question someone can answer.
 2. If a fork appears whose branches differ materially, ask again rather than picking one quietly.
-3. Write the plan with the \`${WRITE_PLAN_TOOL}\` tool. The \`plan\` skill holds the document convention;
+3. Write the plan with the \`${WRITE_PLAN_TOOL}\` tool. The \`deliver\` skill holds the document convention;
    the tool enforces what it can (ISO-dated filename, frontmatter, numbered \`## Steps\`).
    Pass every file you intend to edit in \`files\`; after approval those are the only paths you may touch.
 4. Then STOP. Two lines of summary, no work.
@@ -893,7 +941,7 @@ it in a different session.`,
 			awaitingApproval = last.data.awaitingApproval ?? false;
 			approval = last.data.approval ?? "manual";
 			approvalChosen = last.data.approvalChosen ?? false;
-			interviewed = last.data.interviewed ?? false;
+			interview = deriveInterviewState(last.data.interviewed, last.data.interview);
 			toolsBeforePlanMode = last.data.toolsBeforePlanMode;
 			sessionAllowed = last.data.sessionAllowed ?? [];
 		}

@@ -10,7 +10,7 @@ plan is a **file**, the questions are **asked**, and the gate is **enforced**.
 | `edit` / `write` unusable | removed from the active tool set (`setActiveTools`) **and** blocked in the `tool_call` interceptor |
 | `bash` read-only by default | `utils.ts: explainUnsafe` — the line is split into segments and every segment's executable must be read-only; redirection, substitution, and heredocs are refused outright |
 | anything else asks the human — or does not, in allow-all | `tool_call` interceptor; the human picks the mode when planning starts |
-| the plan is written from answers | `write_plan` refuses until `ask_user` has been used, and every question must name what its answer changes |
+| the plan is written from answers | `write_plan` refuses until an interview is usable (asked in plan mode, or carried unconsumed from earlier in the session), and every question must name what its answer changes |
 | the plan is a file | `write_plan` is the only write channel, and it can only write `docs/plans/YYYY-MM-DD_<slug>.md` |
 | nothing executes early | `edit`/`write` come back only from `approve()` — `/plan go` or the dialog |
 | edits stay in scope | after approval, `edit`/`write` are blocked outside the plan's declared `files`, except the plan document itself |
@@ -40,9 +40,18 @@ by the word "code", the second passed because it began with `ls`. `utils.test.ts
 `ask_user` takes one to six questions, each with optional suggested answers (the human can always
 type their own) and a **required `why`** — the step, file, or verification line the answer changes,
 shown in the dialog as `asked because: …`. A question that cannot name one is refused, because a plan
-written from assumptions is fiction in a confident voice. The prompt asks for two to four questions
-up front — scope, inputs, what "done" means, the constraint about to be assumed — and again mid-plan
-when a fork would change the design.
+written from assumptions is fiction in a confident voice.
+
+The interview state lives in `utils.ts` (`recordInterview`, `consumeInterview`,
+`deriveInterviewState`) because `ask_user` also runs *outside* plan mode: the `deliver` skill
+interviews during triage, and that interview is **carried** into plan mode when the risk test fires
+— `enterPlanMode` no longer resets it. A successful `write_plan` consumes it; `approve()`,
+`exitPlanMode()`, and `leavePlanMode()` clear it, so a stale interview cannot satisfy a later,
+unrelated plan. Only counts are persisted; the Q&A text stays in the session transcript. Sessions
+saved before this change carry only the legacy `interviewed` boolean, which `deriveInterviewState`
+maps onto the new state. `/plan status` reports asked / carried / consumed. The prompt asks for the
+questions up front — scope, inputs, what "done" means, the constraint about to be assumed — and
+again mid-plan when a fork would change the design.
 
 ## Commands
 
@@ -89,7 +98,7 @@ widget and `[DONE:n]` marks completion.
 
 ## Notes
 
-- Lives outside any git repo (`~/.pi/agent/`). If this is worth keeping, move it into a dotfiles
-  repo and symlink, or `pi install` from that source.
+- Ships inside the `pi-plan` package (`pi install git:github.com/fatbigvictor/pi-plan`); the copy
+  under `~/.pi/agent/git/…` is the managed installation, not a place to develop.
 - `docs/plans/` is created on first use. It is a document directory on purpose: `plan/` collides
   with things that are already called plans in other repos (Terraform, billing, npm packages).
