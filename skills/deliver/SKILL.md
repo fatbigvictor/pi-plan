@@ -36,6 +36,12 @@ configs, existing patterns, and docs are looked up, not interviewed. Questions a
 the user owns: goals, scope, trade-offs, priorities, constraints, risk tolerance, what "done"
 means.
 
+When `subagent` is available and authorised by user/project instructions and the study spans more
+than a few files or multiple modules/data layers, delegate discovery to one or more `scout`
+subagents (parallel by seam when independent) instead of reading dozens of files directly in the
+parent. Keep parent context lean for the interview, decisions, and plan; instruct scouts to stay
+strictly read-only during study/plan mode.
+
 ## 2. Classify and announce
 
 State the classification and the question budget in one line before the interview:
@@ -126,10 +132,12 @@ Outcomes:
 ## 6. Execute
 
 **Direct and inline work:** build in vertical slices, prove each with the project's tests or a
-measurable check, and keep the user checkpoint after the first testable slice. If execution
-reveals the classification was wrong — a fork that throws away earlier steps, a file list that
-will not settle — stop and escalate to a formal plan via `request_plan_mode` rather than pushing
-on.
+measurable check, and keep the user checkpoint after the first testable slice. When `subagent`
+is available and authorised by user/project instructions, delegate bounded multi-file edits,
+boilerplate, and test-fix loops to `worker` (one writer at a time) while the parent keeps scope
+decisions, review, and checkpoints. If execution reveals the classification was wrong — a fork
+that throws away earlier steps, a file list that will not settle — stop and escalate to a formal
+plan via `request_plan_mode` rather than pushing on.
 
 **Formal plans** run under the `plan` extension, which enforces what a prompt cannot:
 
@@ -145,7 +153,18 @@ on.
 
 Investigating is part of planning: reading, searching, `git log|diff|show`, and `npm ls` just
 run. For anything else, try it — the human is asked. A refusal means the plan does not need that
-command; plan around it, and do not retry a refused command in a new shape.
+command; plan around it, and do not retry a refused command in a new shape. If `subagent` is
+available and authorised, use read-only `scout` subagents for broad plan-mode investigation too.
+
+**Executing an approved formal plan (`/plan go`):** when `subagent` is available and authorised
+by user/project instructions, dispatch implementation steps to `worker` sequentially (one writer
+at a time) rather than doing multi-file edits and test loops directly in the parent. Each
+`worker` brief must include the step goal, the exact approved `files:` paths (and a rule not to
+edit outside them, since the parent's `tool_call` interceptor does not wrap child processes),
+and the step's verification check. After each `worker` returns, verify the diff and check result
+in the parent, update the plan file (`status: in_progress`, tick `[x]`), emit `[DONE:n]`, and
+proceed to the next step. Keep `ask_user` forks, plan edits, final acceptance, and git actions
+in the parent.
 
 ### The document
 

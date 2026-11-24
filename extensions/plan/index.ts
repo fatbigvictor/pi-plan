@@ -878,10 +878,11 @@ it in a different session.`,
 
 		if (executing && todos.length > 0) {
 			const remaining = todos.filter((t) => !t.completed).map((t) => `${t.step}. ${t.text}`).join("\n");
+			const approvedList = files.length ? files.join(", ") : "(none declared)";
 			return {
 				message: {
 					customType: "plan-execution-context",
-					content: `[EXECUTING PLAN — access to the approved files only]\n\nPlan: ${planPath}\n\nRemaining steps:\n${remaining}\n\nExecute in order. After each step include [DONE:n]. Stay inside the approved files; the plan document itself (${planPath}) is always writable, so tick steps and set \`status: in_progress\` there. If a step turns out to be wrong or a fork appears mid-way, call ${ASK_TOOL} rather than diverging quietly.`,
+					content: `[EXECUTING PLAN — access to the approved files only]\n\nPlan: ${planPath}\nApproved files: ${approvedList}\n\nRemaining steps:\n${remaining}\n\nExecute in order. After each step include [DONE:n]. Stay inside the approved files; the plan document itself (${planPath}) is always writable, so tick steps and set \`status: in_progress\` there. If subagent delegation is enabled by user/project instructions, dispatch bounded implementation steps sequentially to \`worker\` (one writer at a time) passing the exact approved file list and verification check, then verify the result and update the plan in the parent. If a step turns out to be wrong or a fork appears mid-way, call ${ASK_TOOL} rather than diverging quietly.`,
 					display: false,
 				},
 			};
